@@ -1,4 +1,4 @@
-# Review Analysis and Topic Modeling Repository
+# Shop&Go reviews topic identification Repository
 
 This repository contains the initial analysis and topic identification done for shop&go reviews.
 

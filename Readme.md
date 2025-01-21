@@ -47,6 +47,7 @@ This repository contains the initial analysis and topic identification done for 
 ## Usage
 
 ### 0. Installing the requirements
+- Installing Python 3.9.6
 - pip install -r requirements.txt
 
 ### 1. Running the Notebooks

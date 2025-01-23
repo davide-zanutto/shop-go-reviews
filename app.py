@@ -52,7 +52,7 @@ def get_keywords_and_reviews(data):
 def main():
     st.title("Shop & Go reviews")
     
-    json_file = "output.json"
+    json_file = "topics.json"
     data = load_data(json_file)
 
     keyword_map, reviews_by_keyword = get_keywords_and_reviews(data)

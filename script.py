@@ -2,30 +2,148 @@ from google.cloud import bigquery
 from openai import AzureOpenAI
 import os
 from bertopic import BERTopic
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-import nltk
 from dotenv import load_dotenv
 from langdetect import detect
 import json
 import time
+from flask import Flask, request, jsonify, send_file
+import logging
 
 start_time = time.time()
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-client = bigquery.Client()
+app = Flask(__name__)
 
 load_dotenv()
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+service_account_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+if not service_account_path:
+    raise RuntimeError("Service account credentials not found!")
+
+client = bigquery.Client()
+
 api_key = os.getenv("API_KEY")
+
+model = "gpt-4o" 
 
 llm_client = AzureOpenAI(
     api_key=api_key,
     api_version="2023-07-01-preview",
     azure_endpoint="https://derai-vision.openai.azure.com/",
 )
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok"})
+
+
+@app.route('/download')
+def download():
+    file_path = "/tmp/topics.json"
+    return send_file(file_path, as_attachment=True)
+
+
+@app.route('/generate_topics', methods=['POST'])
+def generate_topics():
+    
+    data = request.get_json()
+    start_date = data.get('start_date')
+    end_date = data.get('end_date')
+
+    project_id = 'ingka-online-analytics-prod'
+    dataset_id = 'app_data_v2'
+    table_id = 'app_surveys'
+
+    table_ref = f'{project_id}.{dataset_id}.{table_id}'
+
+    query = f"""
+        SELECT
+            date, 
+            answer_translated
+        FROM {table_ref}
+        WHERE date BETWEEN '{start_date}' AND '{end_date}'
+            AND answer_translated IS NOT NULL AND rating != 0
+        ORDER BY date DESC
+    """
+
+    query_job = client.query(query)
+
+    reviews = [row['answer_translated'] for row in query_job]
+    timestamps = [row['date'] for row in query_job]
+
+    ## Identify and remove non-english reviews
+
+    logger.info("Reviews before processing: %d", len(reviews))
+    logger.info("Processing reviews...")
+
+    filtered_reviews = []
+    filtered_timestamps = []
+    removed_reviews = []
+
+    for review, timestamp in zip(reviews, timestamps):
+        try:
+            if detect(review) == 'en' and len(review.split()) > 1 and len(review) >= 10:
+                filtered_reviews.append(review)
+                filtered_timestamps.append(timestamp)
+            else:
+                removed_reviews.append(review)
+        except:
+            removed_reviews.append(review)
+
+    reviews = filtered_reviews
+
+    logger.info("Reviews after processing: %d", len(reviews))
+
+    logger.info("Running BERTopic...")
+    
+    topic_model = BERTopic()
+
+    topics, probabilities = topic_model.fit_transform(reviews)
+
+    topics = topic_model.get_topics()
+
+    number_of_topics = len(topics)
+    
+    logger.info(f"Generated %d topics", number_of_topics)
+
+    hierarchical_topics = topic_model.hierarchical_topics(reviews)
+
+    logger.info("Getting main topics...")
+    
+    topics_at_depth = get_topics_at_depth(hierarchical_topics, 3)
+    
+    for topic in topics_at_depth:
+        logger.info(f"ID: %s, Name: %s, Distance: %s", topic[0], topic[1], topic[2])
+
+    logger.info("Adjusting main topics...")
+
+    topics = adjust_topics(hierarchical_topics, topics_at_depth, 1)
+
+    logger.info("Generating subtopics...")
+
+    subtopics = get_subtopics_for_topics(hierarchical_topics, topics, 1)
+
+    subtopic_topics = get_leaves(subtopics, hierarchical_topics)
+
+    subtopic_reviews = get_reviews_by_subtopic(subtopic_topics, topic_model, reviews)
+
+    logger.info("Naming topics and creating json file...")
+
+    output_file = "/tmp/topics.json"
+    
+    create_json_structure(subtopics, subtopic_reviews, output_file)
+
+    end_time = time.time()
+
+    logger.info("Execution time: %s seconds (%.2f minutes)", end_time - start_time, (end_time - start_time) / 60)
+    
+    return send_file(output_file, as_attachment=True, download_name="topicsAPI.json")
 
 
 
@@ -296,6 +414,90 @@ def get_subtopic_keyword(topic_keyword, cluster_words):
     return response.choices[0].message.content.strip()
 
 
+def get_review_summary_short(reviews, llm_client, model, selected_subtopic):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a skilled summarizer specializing in customer feedback analysis.\n"
+                "Your role is to identify and concisely summarize the main themes, sentiments, and frequently mentioned points in customer reviews.\n"
+                "The reviews provided are related to an IKEA service and may discuss various aspects such as product quality, delivery, customer service, payment, or store experience.\n" 
+                "The summary you generate will be used by coworkers to understand in a few words what the reviews are talking about.\n"           
+                "Provide the output as a short text summary with no more than 70 words. Do not exceed this limit.\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Please read carefully the following customer reviews and generate a summary of the main aspects that customers are discussing.\n"
+                "The summary should be as concise as possible, only reporting the main aspects.\n"
+                f"The summary should focus on this particular topic: {selected_subtopic}. Ensure that all aspects of the text directly relate to this topic, without introducing unrelated information.\n"
+                "In case an aspect is mentioned in many reviews, the summary should include 'Many customers' to highlight that it is a common positive/negative point.\n"
+                "Focus on the most significant details that are repeated or impactful.\n"
+                "I will provide you with the reviews and you will generate the summary.\n"
+                f"Reviews: {reviews}\n"
+                "Summary:\n"
+            ),
+        },
+    ]
+
+    # Generate the topic word using the language model
+    response = llm_client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=100,
+        temperature=0.5,
+        n=1,
+        stop=None,
+    )
+
+    # Extract and return the topic word
+    return response.choices[0].message.content.strip()
+
+
+def get_review_summary_long(reviews, llm_client, model, selected_subtopic):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a skilled summarizer specializing in customer feedback analysis.\n"
+                "Your role is to identify and concisely summarize the main themes, sentiments, and frequently mentioned points in customer reviews.\n"
+                "The reviews provided are related to an IKEA service and may discuss various aspects such as product quality, delivery, customer service, payment, or store experience.\n" 
+                "The summaries you generate will be used by coworkers to understand comprehensively the main positive and negative aspects of the reviews.\n"           
+                "If a group of reviews does not contain any positive aspects, you can skip the positive points section.\n"           
+                "If a group of reviews does not contain any negative aspects, you can skip the negative points section.\n"           
+                "Provide the output in the following format: \n"
+                "<b>Positive points:</b>\n • Point 1 \n • Point 2 \n ...\n"
+                "<b>Negative points:</b>\n • Point 1 \n • Point 2 \n ...\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Please read carefully the following customer reviews and generate summaries of the main aspects that customers are discussing.\n"
+                "The summary should be comprehensive, touching the main aspects mentioned by customer reviews.\n"
+                f"The summary should focus on this particular topic: {selected_subtopic}. Ensure that all aspects of the text directly relate to this topic, without introducing unrelated information.\n"
+                "In case an aspect is mentioned in many reviews, the summary should include 'Many customers' to highlight that it is a common positive/negative point.\n"
+                f"Reviews: {reviews}\n"
+                "Summary:\n"
+            ),
+        },
+    ]
+
+    # Generate the topic word using the language model
+    response = llm_client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=250,
+        temperature=0.5,
+        n=1,
+        stop=None,
+    )
+
+    # Extract and return the topic word
+    return response.choices[0].message.content.strip()
+
+
 def create_json_structure(subtopics_structure, subtopic_reviews, output_file):
     """
     Create a JSON structure with topics, subtopics, and reviews, and save it to a file.
@@ -310,9 +512,15 @@ def create_json_structure(subtopics_structure, subtopic_reviews, output_file):
     for main_topic, subtopics in subtopics_structure.items():
         topic_name = main_topic[1]
         topic_keyword = get_topic_keyword(topic_name)
+        subtopic_ids = [subtopic[0] for subtopic in subtopics]
+        merged_reviews = [review for subtopic_id in subtopic_ids for review in subtopic_reviews.get(subtopic_id, [])]
+        topic_short_summary = get_review_summary_short(merged_reviews, llm_client, model, topic_keyword)
+        topic_long_summary = get_review_summary_long(merged_reviews, llm_client, model, topic_keyword)
         json_structure[main_topic[1]] = {
-            "keyword": topic_keyword,
-            "subtopics": {}
+            "Keyword": topic_keyword,
+            "Short summary": topic_short_summary,
+            "Long summary": topic_long_summary,
+            "Subtopics": {}
         }
 
         print(f"Processing main topic: {main_topic[0]} - {topic_name}")
@@ -322,10 +530,14 @@ def create_json_structure(subtopics_structure, subtopic_reviews, output_file):
             subtopic_name = subtopic[1]
             subtopic_keyword = get_subtopic_keyword(topic_keyword, subtopic_name)
             reviews = subtopic_reviews.get(subtopic_id, [])
-
-            json_structure[main_topic[1]]["subtopics"][subtopic_name] = {
-                "subtopic_keyword": subtopic_keyword,
-                "reviews": reviews
+            subtopic_short_summary = get_review_summary_short(reviews, llm_client, model, subtopic_keyword)
+            subtopic_long_summary = get_review_summary_long(reviews, llm_client, model, subtopic_keyword)
+            reviews = list(set(reviews))
+            json_structure[main_topic[1]]["Subtopics"][subtopic_name] = {
+                "Subtopic_keyword": subtopic_keyword,
+                "Short summary": subtopic_short_summary,
+                "Long summary": subtopic_long_summary,
+                "Reviews": reviews
             }
 
             print(f"  Subtopic ID: {subtopic_id} - {subtopic_name}")
@@ -339,162 +551,5 @@ def create_json_structure(subtopics_structure, subtopic_reviews, output_file):
 
 
 
-if __name__ == "__main__":
-
-    project_id = 'ingka-online-analytics-prod'
-    dataset_id = 'app_data_v2'
-    table_id = 'app_surveys'
-
-    table_ref = f'{project_id}.{dataset_id}.{table_id}'
-
-    ## Query to test with a fixed number of reviews per day
-
-    num_reviews = 10000
-    num_reviews_per_day = 300
-
-    query_test = f"""
-        WITH ranked_reviews AS (
-            SELECT 
-                date, 
-                answer_translated,
-                ROW_NUMBER() OVER (PARTITION BY date ORDER BY date DESC) as row_num
-            FROM {table_ref}
-            WHERE answer_translated IS NOT NULL AND rating != 0
-        )
-        SELECT *
-        FROM ranked_reviews
-        WHERE row_num <= {num_reviews_per_day}
-        ORDER BY date DESC
-        LIMIT {num_reviews}
-    """
-
-    ## With 6 months of data, the number of reviews will be between 2M and 3M
-    ### Of this, only around 200k have a non-null answer_translated
-
-    query_1_month = f"""
-        SELECT
-            date, 
-            answer_translated
-        FROM {table_ref}
-        WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH) AND current_date()
-            AND answer_translated IS NOT NULL AND rating != 0
-        ORDER BY date DESC
-    """
-
-    query_3_months = f"""
-        SELECT
-            date, 
-            answer_translated
-        FROM {table_ref}
-        WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH) AND current_date()
-            AND answer_translated IS NOT NULL AND rating != 0
-        ORDER BY date DESC
-    """
-
-    query_6_months = f"""
-        SELECT
-            date, 
-            answer_translated
-        FROM {table_ref}
-        WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH) AND current_date()
-            AND answer_translated IS NOT NULL AND rating != 0
-        ORDER BY date DESC
-    """
-
-    query_job = client.query(query_test)
-
-    reviews = [row['answer_translated'] for row in query_job]
-    timestamps = [row['date'] for row in query_job]
-
-    ## Identify and remove non-english reviews
-    ### For 6 months of data, this takes around 10 minutes 
-
-
-    print("Reviews before processing: ", len(reviews))
-    print("Processing reviews...")
-    filtered_reviews = []
-    filtered_timestamps = []
-    removed_reviews = []
-
-    for review, timestamp in zip(reviews, timestamps):
-        try:
-            if detect(review) == 'en' and len(review.split()) > 1 and len(review) >= 10:
-                filtered_reviews.append(review)
-                filtered_timestamps.append(timestamp)
-            else:
-                removed_reviews.append(review)
-        except:
-            removed_reviews.append(review)
-
-    reviews = filtered_reviews
-    timestamps = filtered_timestamps
-
-    print("Reviews after processing: ", len(reviews))
-
-
-    formatted_timestamps = [ts.strftime("%Y-%m-%d") for ts in timestamps]
-
-    stop_words = set(stopwords.words('english')).union(set(ENGLISH_STOP_WORDS))
-
-    processed_reviews = [' '.join([word for word in word_tokenize(review.lower()) if word.isalnum() and word not in stop_words]) for review in reviews]
-
-    ## Limiting the number of topics with nr_topics does not work
-    # nr_topics_before = 'Auto'
-    print("Running BERTopic...")
-    topic_model = BERTopic()
-
-    # Fit the model on the reviews
-    topics, probabilities = topic_model.fit_transform(reviews)
-
-    nr_topics_after = 'auto'
-
-    # Further reduce topics if needed
-    # topic_model.reduce_topics(reviews, nr_topics=nr_topics_after)
-
-    topics_over_time = topic_model.topics_over_time(reviews, formatted_timestamps, datetime_format="%Y-%m-%d", nr_bins=10)
-    topics = topic_model.get_topics()
-
-    topic_info = topic_model.get_topic_info()
-    all_topic_names = '; '.join(topic_info['Name'])
-
-    number_of_topics = len(topics)
-    print(f"Generated {number_of_topics} topics")
-    hierarchical_topics, Z = topic_model.hierarchical_topics(processed_reviews)
-
-
-
-    print("Getting main topics...")
-    topics_at_depth = get_topics_at_depth(hierarchical_topics, 3)
-    for topic in topics_at_depth:
-        print(f"ID: {topic[0]}, Name: {topic[1]}, Distance: {topic[2]}")
-
-    print("Adjusting main topics...")
-
-
-
-    topics = adjust_topics(hierarchical_topics, topics_at_depth, 1)
-
-    print("Generating subtopics...")
-
-
-    subtopics = get_subtopics_for_topics(hierarchical_topics, topics, 1)
-
-
-
-    subtopic_topics = get_leaves(subtopics, hierarchical_topics)
-
-
-
-    subtopic_reviews = get_reviews_by_subtopic(subtopic_topics, topic_model, reviews)
-
-
-    model = "gpt-4o" 
-
-    print("Naming topics and creating json file...")
-
-    output_file = 'topics.json'
-    create_json_structure(subtopics, subtopic_reviews, output_file)
-
-    end_time = time.time()
-
-    print(f"Execution time: {end_time - start_time} seconds ({(end_time - start_time) / 60} minutes)")
+if __name__ == '__main__':
+    app.run(port=int(os.environ.get("PORT", 8080)),host='0.0.0.0',debug=True)

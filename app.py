@@ -1,7 +1,6 @@
 import json
 import streamlit as st
 from openai import AzureOpenAI
-from summaries import get_review_summary_short, get_review_summary_long
 from dotenv import load_dotenv
 import os
 
@@ -33,15 +32,15 @@ def get_keywords_and_reviews(data):
     reviews_by_keyword = {}
 
     for json_key, keyword_data in data.items():
-        display_keyword = keyword_data["keyword"] 
+        display_keyword = keyword_data["Keyword"] 
         keyword_map[display_keyword] = json_key
 
         # Extract subtopics and reviews
-        subtopics = keyword_data["subtopics"]
+        subtopics = keyword_data["Subtopics"]
         reviews_by_keyword[json_key] = {
-            "reviews": [review for subtopic in subtopics.values() for review in subtopic["reviews"]],
-            "subtopics": {
-                subtopic_data["subtopic_keyword"]: subtopic_data["reviews"]
+            "Reviews": [review for subtopic in subtopics.values() for review in subtopic["Reviews"]],
+            "Subtopics": {
+                subtopic_data["Subtopic_keyword"]: subtopic_data["Reviews"]
                 for subtopic_data in subtopics.values()
             },
         }
@@ -57,7 +56,7 @@ def main():
 
     keyword_map, reviews_by_keyword = get_keywords_and_reviews(data)
 
-    if "summary" not in st.session_state:
+    if "Summary" not in st.session_state:
         st.session_state.short_summary = None
         st.session_state.long_summary = None 
 
@@ -71,33 +70,28 @@ def main():
     all_reviews = []
 
     if selected_keyword == "All Keywords":
-        all_reviews = [review for json_key in keyword_map.values() for review in reviews_by_keyword[json_key]["reviews"]]
+        all_reviews = [review for json_key in keyword_map.values() for review in reviews_by_keyword[json_key]["Reviews"]]
     else:
         json_key = keyword_map[selected_keyword]
 
-        subtopics = list(reviews_by_keyword[json_key]["subtopics"].keys())
+        subtopics = list(reviews_by_keyword[json_key]["Subtopics"].keys())
         selected_subtopic = st.sidebar.selectbox("Select a Subtopic", options=["All Subtopics"] + subtopics)
 
         if selected_subtopic == "All Subtopics":
-            all_reviews = reviews_by_keyword[json_key]["reviews"]
+            all_reviews = reviews_by_keyword[json_key]["Reviews"]
         else:
-            all_reviews = reviews_by_keyword[json_key]["subtopics"][selected_subtopic]
+            all_reviews = reviews_by_keyword[json_key]["Subtopics"][selected_subtopic]
 
     st.sidebar.write(f"### Generate a summary")
-    # Sidebar: Generate Summary Button
-    if st.sidebar.button("Short Summary"):
-        if all_reviews:
-            short_summary = get_review_summary_short(all_reviews, llm_client, model, selected_subtopic)
-            st.session_state.short_summary = short_summary
-        else:
-            st.sidebar.write("No reviews available to summarize.")
+    # Sidebar: Display Summary
+    if selected_keyword != "All Keywords":
+        json_key = keyword_map[selected_keyword]
 
-    if st.sidebar.button("Detailed Summary"):
-        if all_reviews:
-            long_summary = get_review_summary_long(all_reviews, llm_client, model, selected_subtopic)
-            st.session_state.long_summary = long_summary 
-        else:
-            st.sidebar.write("No reviews available to summarize.")
+        if st.sidebar.button("Show Short Summary"):
+            st.session_state.short_summary = data[json_key].get("Short summary", "No short summary available.")
+
+        if st.sidebar.button("Show Detailed Summary"):
+            st.session_state.long_summary = data[json_key].get("Long summary", "No detailed summary available.")
 
     if st.session_state.short_summary:
         formatted_summary = st.session_state.short_summary.replace("\n", "<br>")

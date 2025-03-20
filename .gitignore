@@ -1,3 +1,5 @@
 /app-reviews-data
 .env
 *.json
+__pycache__
+/shop-go-api
